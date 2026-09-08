@@ -24,6 +24,23 @@ export function getArchiveExtension(platform: string): string {
   return platform.startsWith('win32') ? 'zip' : 'tar.gz'
 }
 
+/**
+ * Release asset filename, e.g. betterleaks_1.8.1_linux_x64.tar.gz. Must match
+ * the second field of checksums.txt exactly for digest lookup to succeed.
+ */
+export function getAssetName(
+  numericVersion: string,
+  platform: string,
+  arch: string
+): string {
+  const key = `${platform}-${arch}`
+  const assetSuffix = PLATFORM_MAP[key]
+  if (!assetSuffix) {
+    throw new Error(`Unsupported platform/arch: ${key}`)
+  }
+  return `betterleaks_${numericVersion}_${assetSuffix}.${getArchiveExtension(platform)}`
+}
+
 export function getBinaryName(platform: string): string {
   return platform.startsWith('win32') ? 'betterleaks.exe' : 'betterleaks'
 }

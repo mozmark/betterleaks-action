@@ -6,10 +6,16 @@ import {
   TOOL_NAME,
   TOOL_REPO_OWNER,
   TOOL_REPO_NAME,
-  PLATFORM_MAP,
-  getArchiveExtension,
+  getAssetName,
   getBinaryName
 } from './constants'
+import {
+  assertArchiveDigest,
+  assertValidVersion,
+  verifyCachedBinary,
+  verifyChecksumsSignature,
+  writeDigestMarker
+} from './verify'
 
 interface GitHubRelease {
   tag_name: string
@@ -28,6 +34,8 @@ export async function resolveVersion(
   token: string
 ): Promise<string> {
   if (version !== 'latest') {
+    // Validate before the value reaches any URL or signing identity.
+    assertValidVersion(version)
     return ensureVPrefix(version)
   }
 
@@ -52,7 +60,15 @@ export async function resolveVersion(
     )
   }
 
-  return response.result.tag_name
+  // The API response is not trusted input either.
+  const tag = response.result.tag_name
+  assertValidVersion(tag)
+  return tag
+}
+
+/** Base URL for a release's assets. `tag` must already be validated. */
+function getReleaseBaseUrl(tag: string): string {
+  return `https://github.com/${TOOL_REPO_OWNER}/${TOOL_REPO_NAME}/releases/download/${tag}`
 }
 
 export function getDownloadUrl(
@@ -60,17 +76,9 @@ export function getDownloadUrl(
   platform: string,
   arch: string
 ): string {
-  const key = `${platform}-${arch}`
-  const assetSuffix = PLATFORM_MAP[key]
-  if (!assetSuffix) {
-    throw new Error(`Unsupported platform/arch: ${key}`)
-  }
-
-  const tag = ensureVPrefix(version)
-  const numericVersion = stripVPrefix(version)
-  const ext = getArchiveExtension(platform)
-
-  return `https://github.com/${TOOL_REPO_OWNER}/${TOOL_REPO_NAME}/releases/download/${tag}/betterleaks_${numericVersion}_${assetSuffix}.${ext}`
+  assertValidVersion(version)
+  const assetName = getAssetName(stripVPrefix(version), platform, arch)
+  return `${getReleaseBaseUrl(ensureVPrefix(version))}/${assetName}`
 }
 
 export async function install(
@@ -81,29 +89,66 @@ export async function install(
   const arch = process.arch
   const resolvedVersion = await resolveVersion(version, token)
   const numericVersion = stripVPrefix(resolvedVersion)
+  const tag = ensureVPrefix(resolvedVersion)
 
-  // Check tool cache first
+  // Check tool cache first. A cache entry is only usable if it still matches
+  // the digest recorded when it was verified -- the tool cache persists across
+  // jobs on self-hosted runners, so an unverifiable entry is treated as a miss.
   const cachedPath = tc.find(TOOL_NAME, numericVersion, arch)
   if (cachedPath) {
-    core.info(`Found cached betterleaks ${numericVersion}`)
-    return path.join(cachedPath, getBinaryName(platform))
+    const cachedBinary = path.join(cachedPath, getBinaryName(platform))
+    if (verifyCachedBinary(cachedPath, cachedBinary)) {
+      core.info(`Found cached betterleaks ${numericVersion} (digest verified)`)
+      return cachedBinary
+    }
+    core.warning(
+      `Cached betterleaks ${numericVersion} failed digest verification; re-downloading`
+    )
   }
 
-  // Download
-  const downloadUrl = getDownloadUrl(resolvedVersion, platform, arch)
-  core.info(`Downloading betterleaks ${resolvedVersion} from ${downloadUrl}`)
-  const downloadPath = await tc.downloadTool(downloadUrl, undefined, token ? `token ${token}` : undefined)
+  const baseUrl = getReleaseBaseUrl(tag)
+  const assetName = getAssetName(numericVersion, platform, arch)
+
+  core.info(`Downloading betterleaks ${tag} from ${baseUrl}/${assetName}`)
+  const archivePath = await tc.downloadTool(
+    `${baseUrl}/${assetName}`,
+    undefined,
+    token ? `token ${token}` : undefined
+  )
+  const checksumsPath = await tc.downloadTool(`${baseUrl}/checksums.txt`)
+  const bundlePath = await tc.downloadTool(
+    `${baseUrl}/checksums.txt.sigstore.json`
+  )
+
+  // Verify BEFORE extracting: unpacking an unverified archive is itself the
+  // attack surface being closed here. Both calls throw, and main() turns that
+  // into a failed step, so this fails closed.
+  await verifyChecksumsSignature(
+    checksumsPath,
+    bundlePath,
+    tag,
+    process.env['BETTERLEAKS_TUF_CACHE']
+  )
+  const digest = assertArchiveDigest(archivePath, checksumsPath, assetName)
+  core.info(
+    `Verified ${assetName} (sha256:${digest}), signed by the ${tag} release workflow`
+  )
 
   // Extract
   let extractedPath: string
   if (platform === 'win32') {
-    extractedPath = await tc.extractZip(downloadPath)
+    extractedPath = await tc.extractZip(archivePath)
   } else {
-    extractedPath = await tc.extractTar(downloadPath)
+    extractedPath = await tc.extractTar(archivePath)
   }
 
   // Cache
-  const cachedDir = await tc.cacheDir(extractedPath, TOOL_NAME, numericVersion, arch)
+  const cachedDir = await tc.cacheDir(
+    extractedPath,
+    TOOL_NAME,
+    numericVersion,
+    arch
+  )
   const binaryPath = path.join(cachedDir, getBinaryName(platform))
 
   // Ensure executable
@@ -111,6 +156,9 @@ export async function install(
     const {chmod} = await import('fs/promises')
     await chmod(binaryPath, 0o755)
   }
+
+  // Record the extracted binary's digest so later cache hits can be re-checked.
+  writeDigestMarker(cachedDir, binaryPath)
 
   core.info(`Betterleaks ${resolvedVersion} installed to ${binaryPath}`)
   return binaryPath
